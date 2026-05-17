@@ -4,22 +4,13 @@ const app = express();
 app.use(express.json());
 
 // আপনার Render Database URL-টি এখানে বসবে (অথবা Environment Variable হিসেবে সেট করবেন)
+// আপনার server.js ফাইলের এই অংশটুকু এভাবে আপডেট করুন:
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, 
-});
-
-// ডাটাবেজে টেবিল তৈরি করার কোড (যদি আগে থেকে না থাকে)
-const createTable = async () => {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS logs (
-      id SERIAL PRIMARY KEY,
-      user_id VARCHAR(50),
-      timestamp TIMESTAMP,
-      UNIQUE(user_id, timestamp) -- ডুপ্লিকেট ডেটা আটকানোর জন্য
-    );
-  `);
-};
-createTable();
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // ক্লাউড ডাটাবেজে সিকিউর কানেকশনের জন্য এটি বাধ্যতামূলক
+  }
+});createTable();
 
 // এই URL-এ লোকাল এজেন্ট ডেটা পাঠাবে (POST Request)
 app.post('/api/attendance', async (req, res) => {
