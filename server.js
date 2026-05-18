@@ -1,140 +1,178 @@
 const express = require('express');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+
 const app = express();
-
 app.use(express.json());
+app.use(cors());
 
-// Render-এর Environment Variable থেকে সরাসরি ডাটাবেজ কানেক্ট করা
+// Render-এর Environment Variable থেকে ডেটাবেজ কানেকশন নেওয়া
 const dbUrl = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET || 'rubber_board_secret_key_2026';
 
 const pool = new Pool({
   connectionString: dbUrl,
   ssl: dbUrl ? { rejectUnauthorized: false } : false
 });
 
-// ডাটাবেজ কানেকশন চেক এবং অটোমেটিক টেবিল তৈরি করা
+// ডাটাবেজ টেবিলগুলো অটোমেটিক তৈরি করার মাস্টার ফাংশন
 pool.connect(async (err, client, release) => {
   if (err) {
     return console.error('Database connection failed:', err.stack);
   }
-  console.log('Successfully connected to the PostgreSQL database.');
+  console.log('Successfully connected to PostgreSQL.');
   
   try {
-    // attendance টেবিল না থাকলে তা অটো তৈরি করার কুয়েরি
-    const createTableQuery = `
+    // ১. কর্মচারীদের টেবিল (ZKTeco User ID এর সাথে মিল রেখে)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS employees (
+        id VARCHAR(50) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        designation VARCHAR(100),
+        department VARCHAR(100)
+      );
+    `);
+
+    // ২. অ্যাডমিন ও ৪ জন কো-অ্যাডমিন লগইন টেবিল
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) DEFAULT 'co-admin'
+      );
+    `);
+
+    // ৩. নতুন অ্যাডভান্সড অ্যাটেনডেন্স টেবিল
+    await client.query(`
       CREATE TABLE IF NOT EXISTS attendance (
         id SERIAL PRIMARY KEY,
         user_id VARCHAR(50) NOT NULL,
-        timestamp TIMESTAMP NOT NULL
+        timestamp TIMESTAMP NOT NULL,
+        status VARCHAR(20) DEFAULT 'Present',
+        added_by VARCHAR(50) DEFAULT 'Machine'
       );
-    `;
-    await client.query(createTableQuery);
-    console.log('Attendance table is ready or already exists.');
+    `);
+
+    // ডিফল্ট সুপার অ্যাডমিন এবং ৪ জন কো-অ্যাডমিন অটো তৈরি করা (যদি না থাকে)
+    const userCheck = await client.query('SELECT COUNT(*) FROM users');
+    if (parseInt(userCheck.rows[0].count) === 0) {
+      const adminPass = await bcrypt.hash('admin123', 10);
+      const coAdminPass = await bcrypt.hash('coadmin123', 10);
+      
+      // ১ জন সুপার অ্যাডমিন (Username: admin | Password: admin123)
+      await client.query("INSERT INTO users (username, password_hash, role) VALUES ('admin', $1, 'admin')", [adminPass]);
+      
+      // ৪ জন ডিফল্ট কো-অ্যাডমিন অ্যাকাউন্ট (Username: co_admin1 থেকে co_admin4 | Password: coadmin123)
+      for (let i = 1; i <= 4; i++) {
+        await client.query("INSERT INTO users (username, password_hash, role) VALUES ($1, $2, 'co-admin')", [`co_admin${i}`, coAdminPass]);
+      }
+      console.log('Default Admin and 4 Co-Admins created successfully.');
+    }
+
+    console.log('All database tables are initialized and scalable.');
   } catch (tableErr) {
-    console.error('Error creating table:', tableErr);
+    console.error('Error creating infrastructure tables:', tableErr);
   } finally {
     release();
   }
 });
 
-// ১. পাইথন এজেন্ট থেকে ডেটা রিসিভ করার রুট
-app.post('/api/attendance', async (req, res) => {
-  const { user_id, timestamp } = req.body;
+// ==================== এপিআই মডিউল (API MODULES) ====================
 
-  if (!user_id || !timestamp) {
-    return res.status(400).json({ error: 'Missing user_id or timestamp' });
-  }
-
+// ১. সিকিউর লগইন এপিআই (মোবাইল অ্যাপের লগইন স্ক্রিনের জন্য)
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
   try {
-    const queryText = 'INSERT INTO attendance(user_id, timestamp) VALUES($1, $2) RETURNING *';
-    const values = [user_id, timestamp];
-    
-    const result = await pool.query(queryText, values);
-    console.log(`Successfully saved attendance for User: ${user_id}`);
-    
-    res.status(201).json({ message: 'Attendance recorded successfully', data: result.rows[0] });
-  } catch (error) {
-    console.error('Error inserting data into database:', error);
-    res.status(500).json({ error: 'Internal Server Error', details: error.message });
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
+
+    const user = result.rows[0];
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    if (!isMatch) return res.status(401).json({ error: 'Incorrect password' });
+
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ message: 'Login successful', token, role: user.role, username: user.username });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ২. রিমোট পজিশন থেকে লাইভ ডেটা দেখার সুন্দর ড্যাশবোর্ড রুট
-app.get('/dashboard', async (req, res) => {
+// ২. জەکەটেকো মেশিন থেকে ডেটা রিসিভ করার এন্ডপয়েন্ট (মেশিন পাঞ্চ)
+app.post('/api/attendance', async (req, res) => {
+  const { user_id, timestamp } = req.body;
+  if (!user_id || !timestamp) return res.status(400).json({ error: 'Missing user_id or timestamp' });
+
   try {
-    const result = await pool.query('SELECT * FROM attendance ORDER BY timestamp DESC LIMIT 100');
-    const rows = result.rows;
-
-    let html = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ZKTeco Live Attendance Dashboard</title>
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
-            .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            h2 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; margin-top: 0; }
-            .refresh-btn { background-color: #4CAF50; color: white; border: none; padding: 10px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; float: right; }
-            .refresh-btn:hover { background-color: #45a049; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-            th { background-color: #f2f2f2; color: #333; }
-            tr:hover { background-color: #f9f9f9; }
-            .badge { background-color: #e1f5fe; color: #0288d1; padding: 5px 10px; border-radius: 4px; font-weight: bold; }
-        </style>
-        <script>
-            setInterval(function(){ location.reload(); }, 10000);
-        </script>
-    </head>
-    <body>
-        <div class="container">
-            <button class="refresh-btn" onclick="location.reload()">Refresh Live</button>
-            <h2>🔴 ZKTeco Live Attendance Dashboard</h2>
-            <p>নিচে অফিসের সর্বশেষ হাজিরার লাইভ ডেটা দেখানো হচ্ছে (প্রতি ১০ সেকেন্ড পর পর অটো-রিফ্রেশ হবে):</p>
-            <table>
-                <thead>
-                    <tr>
-                        <th>SL</th>
-                        <th>User ID (Machine)</th>
-                        <th>Punch Time & Date</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-    `;
-
-    if(rows.length === 0) {
-        html += `<tr><td colspan="4" style="text-align:center; color: #888;">এখনো কোনো হাজিরার ডেটা পাওয়া যায়নি।</td></tr>`;
-    } else {
-        rows.forEach((row, index) => {
-            html += `
-                <tr>
-                    <td>${index + 1}</td>
-                    <td><span class="badge">User - ${row.user_id}</span></td>
-                    <td><strong>${row.timestamp}</strong></td>
-                    <td style="color: green; font-weight: bold;">✓ Success</td>
-                </tr>
-            `;
-        });
+    // কর্মচারী টেবিলে আইডিটি আগে থেকেই এন্ট্রি করা আছে কি না চেক করা, না থাকলে অটো-ক্রিয়াট করা
+    const empCheck = await pool.query('SELECT id FROM employees WHERE id = $1', [user_id]);
+    if (empCheck.rows.length === 0) {
+      await pool.query('INSERT INTO employees (id, name, designation, department) VALUES ($1, $2, $3, $4)', [user_id, `Employee ${user_id}`, 'Not Set', 'Not Set']);
     }
 
-    html += `
-                </tbody>
-            </table>
-        </div>
-    </body>
-    </html>
-    `;
-
-    res.send(html);
+    const queryText = 'INSERT INTO attendance(user_id, timestamp, status, added_by) VALUES($1, $2, $3, $4) RETURNING *';
+    const result = await pool.query(queryText, [user_id, timestamp, 'Present', 'Machine']);
+    res.status(201).json({ message: 'Recorded', data: result.rows[0] });
   } catch (error) {
-    res.status(500).send("Dashboard Error: " + error.message);
+    res.status(500).json({ error: error.message });
   }
+});
+
+// ৩. বিস্তারিত হাজিরার ডেটা দেখার গেটওয়ে (মোবাইল অ্যাপ ও ড্যাশবোর্ডের জন্য)
+app.get('/api/attendance/list', async (req, res) => {
+  try {
+    // Attendance এবং Employees টেবিল JOIN করে নাম, পদবীসহ বিস্তারিত তথ্য আনা
+    const query = `
+      SELECT a.id, a.user_id, e.name, e.designation, e.department, a.timestamp, a.status, a.added_by 
+      FROM attendance a
+      LEFT JOIN employees e ON a.user_id = e.id
+      ORDER BY a.timestamp DESC LIMIT 200;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ৪. নতুন কর্মচারী যুক্ত বা আপডেট করার এপিআই (CRUD - Create/Update)
+app.post('/api/employees', async (req, res) => {
+  const { id, name, designation, department } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO employees (id, name, designation, department) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET name=$2, designation=$3, department=$4 RETURNING *',
+      [id, name, designation, department]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ৫. ম্যানুয়ালি কোনো হাজিরা রেকর্ড ডিলিট করার এপিআই (CRUD - Delete)
+app.delete('/api/attendance/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM attendance WHERE id = $1', [id]);
+    res.json({ message: 'Attendance record deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// কোর এপিআই গেটওয়ে ট্র্যাকিং রুট
+app.get('/dashboard', (req, res) => {
+  res.send(`
+    <div style="text-align: center; font-family: sans-serif; padding-top: 50px;">
+      <h1 style="color: #4CAF50;">Rubber Board Core API Gateway is Running Live 🚀</h1>
+      <p style="font-size: 18px; color: #555;">মোবাইল অ্যাপ্লিকেশন এবং অ্যাডমিন প্যানেল এখন এই গেটওয়ের সাথে যুক্ত হতে প্রস্তুত।</p>
+    </div>
+  `);
 });
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Render Server is running live on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
